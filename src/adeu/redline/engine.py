@@ -589,6 +589,22 @@ class RedlineEngine:
         if parent.tag == qn("w:ins"):
             grandparent = parent.getparent()
             if grandparent is not None:
+                # When the run is inside a pending `<w:ins>` authored by the
+                # current author, the text was never committed — it was a
+                # proposed insertion from a prior turn. Modifying it now should
+                # amend the proposal in place, not emit a fresh `<w:del>`.
+                # Emitting a `<w:del>` here survives reject-all and restores
+                # the deleted text alongside the original — duplicated content
+                # outside any tracked-change wrapper (LLO-797 / LLO-798).
+                parent_author = parent.get(qn("w:author"))
+                if parent_author is not None and parent_author == self.author:
+                    parent.remove(run._r)
+                    # Return the (possibly now-empty) `<w:ins>` so MODIFICATION
+                    # callers have a positional anchor for the follow-up insert.
+                    # If empty, the placeholder `<w:ins>` will be cleaned up by
+                    # the caller when it inserts its replacement.
+                    return parent
+
                 parent_index = grandparent.index(parent)
                 run_index = parent.index(run._r)
 
@@ -811,16 +827,24 @@ class RedlineEngine:
             if not edit.target_text:
                 continue  # Skip validation for pure index-based insertions
 
-            matches = self.mapper.find_all_match_indices(edit.target_text)
-            active_text = self.mapper.full_text
+            # Resolve against Clean View first: the post-accept text is what an
+            # LLM-driven caller reasons against, so its anchors should resolve
+            # to positions Adeu can safely modify. Raw View would happily match
+            # against content inside a pending `<w:del>` block — Adeu would then
+            # wrap that already-deleted text in a fresh `<w:del>`, and reject-all
+            # restores both copies (duplication outside any tracked-change block,
+            # caught by downstream verifiers).
+            if not self.clean_mapper:
+                self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
+            matches = self.clean_mapper.find_all_match_indices(edit.target_text)
+            active_text = self.clean_mapper.full_text
 
-            # Fallback to Clean View if not found in Raw View (matches heuristic logic)
+            # Fallback to Raw View if not found in Clean View (e.g. anchor on
+            # text inside a pending counterparty deletion — niche but allowed).
             if len(matches) == 0:
-                if not self.clean_mapper:
-                    self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
-                matches = self.clean_mapper.find_all_match_indices(edit.target_text)
+                matches = self.mapper.find_all_match_indices(edit.target_text)
                 if len(matches) > 0:
-                    active_text = self.clean_mapper.full_text
+                    active_text = self.mapper.full_text
 
             # Track 3: Appendix Boundary Validation
             valid_matches = []
@@ -939,13 +963,14 @@ class RedlineEngine:
             if edit._match_start_index is not None:
                 resolved_edits.append((edit, getattr(edit, "new_text", None)))
             elif isinstance(edit, (InsertTableRow, DeleteTableRow)):
-                # Simplified resolution for structural edits
-                matches = self.mapper.find_all_match_indices(edit.target_text)
+                # Simplified resolution for structural edits. Match clean-view-first
+                # for the same reason as validate_edits / _pre_resolve_heuristic_edit:
+                # avoid resolving against text inside pending `<w:del>` blocks.
+                if not self.clean_mapper:
+                    self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
+                matches = self.clean_mapper.find_all_match_indices(edit.target_text)
                 if not matches:
-                    # Try clean view
-                    if not self.clean_mapper:
-                        self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
-                    matches = self.clean_mapper.find_all_match_indices(edit.target_text)
+                    matches = self.mapper.find_all_match_indices(edit.target_text)
 
                 if matches:
                     # validate_edits already ensured uniqueness
@@ -1125,24 +1150,25 @@ class RedlineEngine:
         if not edit.target_text:
             return None
 
-        start_idx, match_len = self.mapper.find_match_index(edit.target_text)
+        # Resolve against Clean View first — LLM anchors should never land inside
+        # a pending `<w:del>` block. See validate_edits for the full rationale.
+        if not self.clean_mapper:
+            self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
+        start_idx, match_len = self.clean_mapper.find_match_index(edit.target_text)
+        use_clean_map = True
 
-        # FALLBACK: If Raw View match failed, try matching against Clean View
-        use_clean_map = False
+        # Fallback to Raw View if not found in Clean View.
         if start_idx == -1:
-            if not self.clean_mapper:
-                self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
-
-            start_idx, match_len = self.clean_mapper.find_match_index(edit.target_text)
+            start_idx, match_len = self.mapper.find_match_index(edit.target_text)
             if start_idx != -1:
-                use_clean_map = True
+                use_clean_map = False
             else:
                 return None
 
         active_mapper = self.clean_mapper if use_clean_map else self.mapper
 
         effective_new_text = edit.new_text or ""
-        actual_doc_text = self.mapper.full_text[start_idx : start_idx + match_len]
+        actual_doc_text = active_mapper.full_text[start_idx : start_idx + match_len]
 
         if "](" in actual_doc_text:
             t_links = list(re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", actual_doc_text))
@@ -1208,8 +1234,9 @@ class RedlineEngine:
                     n_clean = n_cell.strip()
 
                     if a_clean:
-                        # Align exactly to where this cell's text begins in the real document
-                        actual_start = self.mapper.full_text.find(a_clean, search_offset)
+                        # Align exactly to where this cell's text begins in the real document.
+                        # Search the active mapper so the offset matches start_idx's coordinate system.
+                        actual_start = active_mapper.full_text.find(a_clean, search_offset)
                         if actual_start == -1 or actual_start > search_offset + 10:
                             actual_start = search_offset  # fallback if not found cleanly
                     else:
@@ -1257,7 +1284,7 @@ class RedlineEngine:
                     if a_clean:
                         search_offset = actual_start + len(a_clean)
 
-                    next_pipe = self.mapper.full_text.find(" | ", search_offset)
+                    next_pipe = active_mapper.full_text.find(" | ", search_offset)
                     if next_pipe != -1 and next_pipe <= search_offset + 10:
                         # The start of the next cell is exactly 3 chars after the pipe index
                         search_offset = next_pipe + 3

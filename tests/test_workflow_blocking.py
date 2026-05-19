@@ -13,7 +13,20 @@ def test_repro_workflow_blocking():
     Scenario:
     1. Doc has tracked changes (from Round 1).
     2. User tries to edit that tracked text (Round 2).
-    3. Engine should NOT skip it, but convert it to a replacement.
+    3. Engine should NOT skip it; it should amend the proposal in place.
+
+    Note: this fork (TechGC) intentionally diverges from upstream Adeu here.
+    Upstream emits a separate `<w:del>` for the round-1 insertion so the
+    deletion shows in CriticMarkup as `{--Round1--}`. That `<w:del>` survives
+    reject-all and, in multi-author documents, restores the deleted text
+    *outside* any tracked-change wrapper — duplicated content that fails the
+    legal-safety verifier (LLO-797 / LLO-798 in The Suite's tracker).
+
+    Word-correct semantics for "delete inside a pending same-author `<w:ins>`"
+    is to amend the proposal in place: just remove the run from the existing
+    `<w:ins>`. The text was never committed, so there is nothing to track as
+    deleted. After amend, MODIFICATION inserts the new content adjacent to
+    the (possibly now-empty) `<w:ins>` placeholder.
     """
     doc = Document()
     doc.add_paragraph("Start ")
@@ -48,8 +61,10 @@ def test_repro_workflow_blocking():
 
     # Should contain Round2
     assert "Round2" in final_text
-    # Round1 should be tracked as deleted natively instead of wiped entirely
-    assert "{--Round1--}" in final_text
+    # And specifically NOT a deletion of Round1 — the round-1 text was never
+    # committed, so amend-in-place applies. Asserting absence locks the
+    # divergence from upstream.
+    assert "{--Round1--}" not in final_text
 
 
 def test_repro_workflow_blocking_target_with_markup():
