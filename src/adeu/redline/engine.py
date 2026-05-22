@@ -1355,6 +1355,49 @@ class RedlineEngine:
                 proxy_edit._active_mapper_ref = active_mapper
                 return proxy_edit
 
+            if (
+                effective_op == EditOperationType.MODIFICATION
+                and len(final_target) > 100
+                and final_new
+            ):
+                from difflib import SequenceMatcher
+
+                matcher = SequenceMatcher(None, final_target, final_new)
+                similarity = matcher.ratio()
+                if similarity > 0.7:
+                    sub_edits: list[ModifyText] = []
+                    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                        if tag == "equal":
+                            continue
+                        sub = ModifyText(
+                            type="modify",
+                            target_text=final_target[i1:i2],
+                            new_text=final_new[j1:j2],
+                            comment=None,
+                        )
+                        sub._match_start_index = effective_start_idx + i1
+                        sub._active_mapper_ref = active_mapper
+                        if tag == "delete":
+                            sub._internal_op = EditOperationType.DELETION
+                        elif tag == "insert":
+                            sub._internal_op = EditOperationType.INSERTION
+                        else:
+                            sub._internal_op = EditOperationType.MODIFICATION
+                        sub_edits.append(sub)
+                    if sub_edits and len(sub_edits) > 1:
+                        sub_edits[0].comment = edit.comment
+                        for sub in sub_edits[1:]:
+                            sub.comment = ""
+                        logger.info(
+                            "Adeu surgical split: target_len=%d new_len=%d sim=%.2f fanout=%d sub_lens=%s",
+                            len(final_target),
+                            len(final_new),
+                            similarity,
+                            len(sub_edits),
+                            [len(s.target_text or "") for s in sub_edits],
+                        )
+                        return sub_edits
+
         proxy_edit = ModifyText(
             type="modify",
             target_text=final_target,
