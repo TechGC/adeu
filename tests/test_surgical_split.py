@@ -1,21 +1,9 @@
-"""Tests for _try_surgical_split — the per-opcode fan-out helper that splits
-high-similarity ModifyText edits into surgical sub-edits.
-
-See `adeu.redline.engine._try_surgical_split` for the function under test and
-the rationale behind the default thresholds.
-"""
-
 import io
 
 from docx import Document
 
 from adeu.models import EditOperationType, ModifyText
 from adeu.redline.engine import RedlineEngine, _try_surgical_split
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: _try_surgical_split returns None when the input does not qualify.
-# ---------------------------------------------------------------------------
 
 
 def _stub_edit(comment="rationale"):
@@ -63,11 +51,6 @@ def test_returns_none_when_single_opcode():
         _stub_edit(), target, new, effective_start_idx=0, active_mapper=None
     )
     assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Unit tests: the splitter fires and returns sub-edits with expected shape.
-# ---------------------------------------------------------------------------
 
 
 def test_splits_high_similarity_long_target_into_sub_edits():
@@ -160,11 +143,6 @@ def test_internal_op_set_per_opcode():
         assert sub._internal_op in valid_ops
 
 
-# ---------------------------------------------------------------------------
-# Unit tests: custom thresholds via keyword arguments.
-# ---------------------------------------------------------------------------
-
-
 def test_custom_min_target_len_allows_shorter_splits():
     """Caller can lower the length floor to attack shorter restate-shaped edits."""
     target = "ABCDEF GHIJKLM" + " filler" * 5  # ~55 chars
@@ -194,13 +172,6 @@ def test_custom_min_similarity_can_disable_splitter():
         min_similarity=1.5,
     )
     assert result is None
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: drive a fixture through RedlineEngine.apply_edits and assert
-# the output XML shows surgical (small) tracked changes, not paragraph-wide
-# delete-and-restate.
-# ---------------------------------------------------------------------------
 
 
 def _build_long_paragraph_docx() -> io.BytesIO:
