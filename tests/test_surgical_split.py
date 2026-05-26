@@ -1,4 +1,5 @@
 import io
+from difflib import SequenceMatcher
 
 from docx import Document
 
@@ -129,8 +130,6 @@ def test_internal_op_set_per_opcode():
     opcode (not just any legal EditOperationType). The fixture is chosen to
     produce all three non-equal opcode kinds (replace, delete, insert) so the
     mapping is exercised end to end."""
-    from difflib import SequenceMatcher
-
     target = "Header AAA " + ("padding word " * 20) + " Footer DEL_ME BBB end."
     new = "Header XXX " + ("padding word " * 20) + " Footer BBB end INSERTED."
     result = _try_surgical_split(
