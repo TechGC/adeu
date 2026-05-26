@@ -147,6 +147,8 @@ def _try_surgical_split(
         return None
 
     sub_edits[0].comment = edit.comment
+    for sub in sub_edits[1:]:
+        sub.comment = ""
     logger.info(
         "Adeu surgical split",
         target_len=len(final_target),

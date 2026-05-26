@@ -121,26 +121,41 @@ def test_comment_attached_to_first_sub_edit_only():
     assert result is not None
     assert result[0].comment == "only-rationale-on-first"
     for sub in result[1:]:
-        assert sub.comment is None or sub.comment == ""
+        assert sub.comment == ""
 
 
 def test_internal_op_set_per_opcode():
-    """Each sub-edit must carry _internal_op matching its diff opcode kind.
-    Use a fixture with both a replace AND a pure-deletion region to exercise
-    multiple opcode kinds in one input."""
+    """Each sub-edit must carry the _internal_op kind matching its source diff
+    opcode (not just any legal EditOperationType). The fixture is chosen to
+    produce all three non-equal opcode kinds (replace, delete, insert) so the
+    mapping is exercised end to end."""
+    from difflib import SequenceMatcher
+
     target = "Header AAA " + ("padding word " * 20) + " Footer DEL_ME BBB end."
-    new = "Header XXX " + ("padding word " * 20) + " Footer BBB end."
+    new = "Header XXX " + ("padding word " * 20) + " Footer BBB end INSERTED."
     result = _try_surgical_split(
         _stub_edit(), target, new, effective_start_idx=0, active_mapper=None
     )
     assert result is not None
-    valid_ops = {
-        EditOperationType.DELETION,
-        EditOperationType.INSERTION,
-        EditOperationType.MODIFICATION,
+
+    opcode_to_internal = {
+        "delete": EditOperationType.DELETION,
+        "insert": EditOperationType.INSERTION,
+        "replace": EditOperationType.MODIFICATION,
     }
-    for sub in result:
-        assert sub._internal_op in valid_ops
+    expected = [
+        opcode_to_internal[tag]
+        for tag, *_ in SequenceMatcher(None, target, new).get_opcodes()
+        if tag != "equal"
+    ]
+    actual = [sub._internal_op for sub in result]
+
+    assert actual == expected, (
+        f"opcode mapping mismatch: expected {expected}, got {actual}"
+    )
+    # Sanity check: the fixture must actually exercise more than one kind, else
+    # the test could pass on a monomorphic mapping.
+    assert len(set(actual)) >= 2
 
 
 def test_custom_min_target_len_allows_shorter_splits():
