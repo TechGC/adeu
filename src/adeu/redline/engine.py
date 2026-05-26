@@ -2,6 +2,7 @@
 import datetime
 import re
 from copy import deepcopy
+from difflib import SequenceMatcher
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +30,11 @@ from adeu.utils.docx import create_attribute, create_element
 
 logger = structlog.get_logger(__name__)
 
+# Defaults for _try_surgical_split. See that function's docstring for the
+# rationale behind each threshold.
+DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN = 100
+DEFAULT_SURGICAL_SPLIT_MIN_SIMILARITY = 0.7
+
 # Register w16du namespace for dateUtc
 w16du_ns = "http://schemas.microsoft.com/office/word/2023/wordml/word16du"
 if "w16du" not in nsmap:
@@ -41,6 +47,120 @@ class BatchValidationError(Exception):
     def __init__(self, errors: List[str]):
         super().__init__("Batch validation failed:\n" + "\n".join(errors))
         self.errors = errors
+
+
+def _try_surgical_split(
+    edit: ModifyText,
+    final_target: str,
+    final_new: str,
+    effective_start_idx: int,
+    active_mapper: DocumentMapper,
+    *,
+    min_target_len: int = DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN,
+    min_similarity: float = DEFAULT_SURGICAL_SPLIT_MIN_SIMILARITY,
+) -> Optional[List[ModifyText]]:
+    """
+    Splits a single high-similarity ModifyText into per-opcode surgical sub-edits.
+
+    Some redline callers — particularly LLM-driven pipelines — emit `target_text`
+    that wraps a small change in a long verbatim context (e.g. a 395-char
+    paragraph quoted in order to remove a 6-char sub-clause). After
+    `trim_common_context` strips identical prefix and suffix at word/Markdown
+    boundaries, a long residual with high target↔new similarity remains. If
+    that residual is applied as a single ModifyText, Word renders it as a
+    wall of strikethrough and re-insertion in the review pane even though the
+    semantic change is tiny — what end users typically describe as "the engine
+    deleted the paragraph and typed it back identically."
+
+    This helper runs a character-level diff (`difflib.SequenceMatcher`) on the
+    post-trim residual and fans the edit out into one sub-edit per non-equal
+    opcode. Each sub-edit covers only the chars that actually changed, with
+    `_match_start_index` rebased so the existing INSERTION / DELETION /
+    MODIFICATION apply paths can route them without further coordinate work.
+
+    Only the first sub-edit carries the original `edit.comment`; the remaining
+    sub-edits are emitted with no comment, so that Word does not render
+    duplicate comment balloons for what is logically a single rationale.
+
+    Args:
+        edit: the originating ModifyText. Only `edit.comment` is read.
+        final_target: target text AFTER `trim_common_context` (residual only).
+        final_new: replacement text AFTER `trim_common_context`.
+        effective_start_idx: mapper-coordinate start of `final_target`, used to
+            rebase each sub-edit's `_match_start_index`.
+        active_mapper: the DocumentMapper to attach to each sub-edit so apply
+            does not re-locate.
+        min_target_len: minimum residual `final_target` length to consider
+            splitting (default 100). Below this, even an unsplit edit produces
+            visually compact tracked changes — splitting buys nothing and
+            increases edit-count noise in the review pane. Observed problem
+            cases on real contracts had residuals of 290–500 chars after
+            `trim_common_context`, so 100 leaves a comfortable safety margin
+            without trimming too aggressively. Tune lower if your renderer
+            gives small marks disproportionate visual weight.
+        min_similarity: minimum `SequenceMatcher.ratio()` between `final_target`
+            and `final_new` to consider splitting (default 0.7). Below this,
+            the two strings differ enough that the unsplit edit reads as an
+            intentional rewrite, not a "small change in long context", and
+            splitting fragments the rewrite into many tiny marks that obscure
+            the author's intent. The 0.7 threshold corresponds to ~70% of
+            characters being identical between target and new; above it, the
+            edit is overwhelmingly a restate-shaped pattern. Tune higher
+            (e.g. 0.85) if you only want to attack the most extreme cases.
+
+    Returns:
+        A list of ModifyText sub-edits (length ≥ 2) when the input qualifies
+        for splitting AND the diff produces multiple changed regions. Returns
+        None when the caller should fall through to the unsplit apply path.
+        Specifically, None is returned when:
+          - `final_new` is empty (pure deletion — no diff to compute);
+          - `len(final_target) <= min_target_len` (residual too short to bother);
+          - `SequenceMatcher.ratio() <= min_similarity` (real rewrite, not restate);
+          - the diff yields at most one non-equal opcode (no fan-out gain).
+    """
+    if not final_new:
+        return None
+    if len(final_target) <= min_target_len:
+        return None
+
+    matcher = SequenceMatcher(None, final_target, final_new)
+    similarity = matcher.ratio()
+    if similarity <= min_similarity:
+        return None
+
+    sub_edits: List[ModifyText] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        sub = ModifyText(
+            type="modify",
+            target_text=final_target[i1:i2],
+            new_text=final_new[j1:j2],
+            comment=None,
+        )
+        sub._match_start_index = effective_start_idx + i1
+        sub._active_mapper_ref = active_mapper
+        if tag == "delete":
+            sub._internal_op = EditOperationType.DELETION
+        elif tag == "insert":
+            sub._internal_op = EditOperationType.INSERTION
+        else:
+            sub._internal_op = EditOperationType.MODIFICATION
+        sub_edits.append(sub)
+
+    if len(sub_edits) <= 1:
+        return None
+
+    sub_edits[0].comment = edit.comment
+    logger.info(
+        "Adeu surgical split",
+        target_len=len(final_target),
+        new_len=len(final_new),
+        similarity=round(similarity, 3),
+        fanout=len(sub_edits),
+        sub_lens=[len(s.target_text or "") for s in sub_edits],
+    )
+    return sub_edits
 
 
 class RedlineEngine:
@@ -1355,48 +1475,12 @@ class RedlineEngine:
                 proxy_edit._active_mapper_ref = active_mapper
                 return proxy_edit
 
-            if (
-                effective_op == EditOperationType.MODIFICATION
-                and len(final_target) > 100
-                and final_new
-            ):
-                from difflib import SequenceMatcher
-
-                matcher = SequenceMatcher(None, final_target, final_new)
-                similarity = matcher.ratio()
-                if similarity > 0.7:
-                    sub_edits: list[ModifyText] = []
-                    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                        if tag == "equal":
-                            continue
-                        sub = ModifyText(
-                            type="modify",
-                            target_text=final_target[i1:i2],
-                            new_text=final_new[j1:j2],
-                            comment=None,
-                        )
-                        sub._match_start_index = effective_start_idx + i1
-                        sub._active_mapper_ref = active_mapper
-                        if tag == "delete":
-                            sub._internal_op = EditOperationType.DELETION
-                        elif tag == "insert":
-                            sub._internal_op = EditOperationType.INSERTION
-                        else:
-                            sub._internal_op = EditOperationType.MODIFICATION
-                        sub_edits.append(sub)
-                    if sub_edits and len(sub_edits) > 1:
-                        sub_edits[0].comment = edit.comment
-                        for sub in sub_edits[1:]:
-                            sub.comment = ""
-                        logger.info(
-                            "Adeu surgical split: target_len=%d new_len=%d sim=%.2f fanout=%d sub_lens=%s",
-                            len(final_target),
-                            len(final_new),
-                            similarity,
-                            len(sub_edits),
-                            [len(s.target_text or "") for s in sub_edits],
-                        )
-                        return sub_edits
+            if effective_op == EditOperationType.MODIFICATION:
+                sub_edits = _try_surgical_split(
+                    edit, final_target, final_new, effective_start_idx, active_mapper
+                )
+                if sub_edits is not None:
+                    return sub_edits
 
         proxy_edit = ModifyText(
             type="modify",
