@@ -704,20 +704,13 @@ class RedlineEngine:
         if parent.tag == qn("w:ins"):
             grandparent = parent.getparent()
             if grandparent is not None:
-                # When the run is inside a pending `<w:ins>` authored by the
-                # current author, the text was never committed — it was a
-                # proposed insertion from a prior turn. Modifying it now should
-                # amend the proposal in place, not emit a fresh `<w:del>`.
-                # Emitting a `<w:del>` here survives reject-all and restores
-                # the deleted text alongside the original — duplicated content
-                # outside any tracked-change wrapper (LLO-797 / LLO-798).
+                # Amend the pending same-author insertion in place: wrapping
+                # an uncommitted run in <w:del> would duplicate content on reject-all.
                 parent_author = parent.get(qn("w:author"))
                 if parent_author is not None and parent_author == self.author:
                     parent.remove(run._r)
-                    # Return the (possibly now-empty) `<w:ins>` so MODIFICATION
-                    # callers have a positional anchor for the follow-up insert.
-                    # If empty, the placeholder `<w:ins>` will be cleaned up by
-                    # the caller when it inserts its replacement.
+                    # Return the (possibly empty) <w:ins> as the positional anchor
+                    # for the follow-up insert; caller cleans up if empty.
                     return parent
 
                 parent_index = grandparent.index(parent)
@@ -942,20 +935,16 @@ class RedlineEngine:
             if not edit.target_text:
                 continue  # Skip validation for pure index-based insertions
 
-            # Resolve against Clean View first: the post-accept text is what an
-            # LLM-driven caller reasons against, so its anchors should resolve
-            # to positions Adeu can safely modify. Raw View would happily match
-            # against content inside a pending `<w:del>` block — Adeu would then
-            # wrap that already-deleted text in a fresh `<w:del>`, and reject-all
-            # restores both copies (duplication outside any tracked-change block,
-            # caught by downstream verifiers).
+            # Resolve against Clean View first so anchors never land inside a
+            # pending <w:del> block (which would wrap already-deleted text in a
+            # fresh <w:del> and duplicate it on reject-all).
             if not self.clean_mapper:
                 self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
             matches = self.clean_mapper.find_all_match_indices(edit.target_text)
             active_text = self.clean_mapper.full_text
 
-            # Fallback to Raw View if not found in Clean View (e.g. anchor on
-            # text inside a pending counterparty deletion — niche but allowed).
+            # Fallback to Raw View when the anchor is on text inside a pending
+            # counterparty deletion (niche but allowed).
             if len(matches) == 0:
                 matches = self.mapper.find_all_match_indices(edit.target_text)
                 if len(matches) > 0:
