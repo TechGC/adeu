@@ -10,12 +10,7 @@ import io
 from docx import Document
 
 from adeu.models import EditOperationType, ModifyText
-from adeu.redline.engine import (
-    DEFAULT_SURGICAL_SPLIT_MIN_SIMILARITY,
-    DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN,
-    RedlineEngine,
-    _try_surgical_split,
-)
+from adeu.redline.engine import RedlineEngine, _try_surgical_split
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +25,7 @@ def _stub_edit(comment="rationale"):
 
 def test_returns_none_when_new_text_empty():
     """Pure deletion: nothing to diff against, helper bails out."""
-    long_target = "x" * (DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN + 50)
+    long_target = "x" * 150  # comfortably above the default min_target_len of 100
     result = _try_surgical_split(
         _stub_edit(), long_target, "", effective_start_idx=0, active_mapper=None
     )
@@ -96,7 +91,7 @@ def test_splits_high_similarity_long_target_into_sub_edits():
         + ("another stretch of equal content " * 2)
         + "ZZZ end"
     )
-    assert len(target) > DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN
+    assert len(target) > 100  # comfortably above default min_target_len
     result = _try_surgical_split(
         _stub_edit("rationale-A"),
         target,

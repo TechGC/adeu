@@ -30,11 +30,6 @@ from adeu.utils.docx import create_attribute, create_element
 
 logger = structlog.get_logger(__name__)
 
-# Defaults for _try_surgical_split. See that function's docstring for the
-# rationale behind each threshold.
-DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN = 100
-DEFAULT_SURGICAL_SPLIT_MIN_SIMILARITY = 0.7
-
 # Register w16du namespace for dateUtc
 w16du_ns = "http://schemas.microsoft.com/office/word/2023/wordml/word16du"
 if "w16du" not in nsmap:
@@ -56,8 +51,8 @@ def _try_surgical_split(
     effective_start_idx: int,
     active_mapper: DocumentMapper,
     *,
-    min_target_len: int = DEFAULT_SURGICAL_SPLIT_MIN_TARGET_LEN,
-    min_similarity: float = DEFAULT_SURGICAL_SPLIT_MIN_SIMILARITY,
+    min_target_len: int = 100,
+    min_similarity: float = 0.7,
 ) -> Optional[List[ModifyText]]:
     """
     Splits a single high-similarity ModifyText into per-opcode surgical sub-edits.
