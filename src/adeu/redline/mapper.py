@@ -40,6 +40,8 @@ class TextSpan:
 
 
 class DocumentMapper:
+    _FIELD_MARKUP_RE = re.compile(r"\[~(?P<xref>.*?)~\]\(#[^)]*\)|\{#[^}]*\}")
+
     def __init__(self, doc: DocumentObject, clean_view: bool = False):
         self.doc = doc
         self.clean_view = clean_view
@@ -507,6 +509,99 @@ class DocumentMapper:
     def _replace_smart_quotes(self, text: str) -> str:
         return text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
 
+    def _build_field_visible_projection(self, text: str) -> Tuple[str, List[int]]:
+        """Projects Word field markup to its visible text, keeping an index map back to `text`.
+
+        Cross-reference fields are emitted as ``[~10.16~](#_Ref…)`` and bookmark
+        anchors as ``{#_Ref…}``. An LLM-driven caller anchors on the *visible*
+        text (``10.16``; bookmarks render nothing), so matching that anchor
+        against the raw markup fails. Returns ``(visible, index_map)`` where
+        ``visible`` is the field-collapsed projection and ``index_map[i]`` is the
+        offset in ``text`` of visible char ``i`` (with a trailing sentinel
+        ``index_map[len(visible)] == len(text)``), so a match found in the
+        projection can be mapped back to real ``full_text`` offsets.
+        """
+        visible_chars: List[str] = []
+        index_map: List[int] = []
+        last = 0
+        for mo in self._FIELD_MARKUP_RE.finditer(text):
+            for i in range(last, mo.start()):
+                visible_chars.append(text[i])
+                index_map.append(i)
+            xref = mo.group("xref")
+            if xref:
+                inner_start = mo.start() + 2  # past the leading "[~"
+                for k, ch in enumerate(xref):
+                    visible_chars.append(ch)
+                    index_map.append(inner_start + k)
+            last = mo.end()
+        for i in range(last, len(text)):
+            visible_chars.append(text[i])
+            index_map.append(i)
+        index_map.append(len(text))
+        return "".join(visible_chars), index_map
+
+    def _map_visible_span_to_full(self, v_start: int, v_len: int, index_map: List[int]) -> Tuple[int, int]:
+        """Maps a (start, length) span in a field-visible projection back to raw ``full_text`` offsets."""
+        orig_start = index_map[v_start]
+        if v_len <= 0:
+            return orig_start, 0
+        orig_end = index_map[v_start + v_len - 1] + 1
+        return orig_start, orig_end - orig_start
+
+    def _find_index_in(self, target_text: str, haystack: str) -> Tuple[int, int]:
+        """Runs the exact → smart-quote → markdown-strip → fuzzy-regex ladder against `haystack`."""
+        start_idx = haystack.find(target_text)
+        if start_idx != -1:
+            return start_idx, len(target_text)
+
+        norm_full = self._replace_smart_quotes(haystack)
+        norm_target = self._replace_smart_quotes(target_text)
+        start_idx = norm_full.find(norm_target)
+        if start_idx != -1:
+            return start_idx, len(target_text)
+
+        stripped_target = self._strip_markdown_formatting(target_text)
+        if stripped_target in haystack:
+            return haystack.find(stripped_target), len(stripped_target)
+
+        try:
+            pattern = self._make_fuzzy_regex(target_text)
+            match = re.search(pattern, haystack)
+            if match:
+                return match.start(), match.end() - match.start()
+        except re.error:
+            pass
+
+        return -1, 0
+
+    def _find_all_indices_in(self, target_text: str, haystack: str) -> List[Tuple[int, int]]:
+        """Runs the exact → smart-quote → markdown-strip → fuzzy-regex ladder against `haystack`, all matches."""
+        matches = [m.span() for m in re.finditer(re.escape(target_text), haystack)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        norm_full = self._replace_smart_quotes(haystack)
+        norm_target = self._replace_smart_quotes(target_text)
+        matches = [m.span() for m in re.finditer(re.escape(norm_target), norm_full)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        stripped_target = self._strip_markdown_formatting(target_text)
+        matches = [m.span() for m in re.finditer(re.escape(stripped_target), haystack)]
+        if matches:
+            return [(s, e - s) for s, e in matches]
+
+        try:
+            pattern = self._make_fuzzy_regex(target_text)
+            matches = [m.span() for m in re.finditer(pattern, haystack)]
+            if matches:
+                return [(s, e - s) for s, e in matches]
+        except re.error:
+            pass
+
+        return []
+
     def _make_fuzzy_regex(self, target_text: str) -> str:
         """
         Constructs a regex from target text permitting variable whitespace,
@@ -557,32 +652,19 @@ class DocumentMapper:
         Returns (start_index, match_length).
         Returns (-1, 0) if not found.
         """
-        # 1. Exact Match
-        start_idx = self.full_text.find(target_text)
+        start_idx, length = self._find_index_in(target_text, self.full_text)
         if start_idx != -1:
-            return start_idx, len(target_text)
+            return start_idx, length
 
-        # 2. Smart Quote Normalization
-        norm_full = self._replace_smart_quotes(self.full_text)
-        norm_target = self._replace_smart_quotes(target_text)
-        start_idx = norm_full.find(norm_target)
-        if start_idx != -1:
-            return start_idx, len(target_text)
-
-        # 3. Strip markdown from target and try matching against raw haystack.
-        stripped_target = self._strip_markdown_formatting(target_text)
-        if stripped_target in self.full_text:
-            start_idx = self.full_text.find(stripped_target)
-            return start_idx, len(stripped_target)
-
-        # 4. Fuzzy Regex Match
-        try:
-            pattern = self._make_fuzzy_regex(target_text)
-            match = re.search(pattern, self.full_text)
-            if match:
-                return match.start(), match.end() - match.start()
-        except re.error:
-            pass
+        # Field-markup fallback: callers anchor on visible text, but Word cross-ref
+        # fields/bookmarks inject CriticMarkup ([~N~](#_Ref…), {#_Ref…}) into full_text,
+        # so the raw ladder above misses. Match against the field-collapsed projection
+        # and map the hit back to real full_text offsets (markup-inclusive span).
+        visible, index_map = self._build_field_visible_projection(self.full_text)
+        if len(visible) != len(self.full_text):
+            v_start, v_len = self._find_index_in(target_text, visible)
+            if v_start != -1:
+                return self._map_visible_span_to_full(v_start, v_len, index_map)
 
         return -1, 0
 
@@ -594,32 +676,16 @@ class DocumentMapper:
         if not target_text:
             return []
 
-        # 1. Exact Match
-        matches = [m.span() for m in re.finditer(re.escape(target_text), self.full_text)]
+        matches = self._find_all_indices_in(target_text, self.full_text)
         if matches:
-            return [(s, e - s) for s, e in matches]
+            return matches
 
-        # 2. Smart Quote Normalization
-        norm_full = self._replace_smart_quotes(self.full_text)
-        norm_target = self._replace_smart_quotes(target_text)
-        matches = [m.span() for m in re.finditer(re.escape(norm_target), norm_full)]
-        if matches:
-            return [(s, e - s) for s, e in matches]
-
-        # 3. Strip markdown from target
-        stripped_target = self._strip_markdown_formatting(target_text)
-        matches = [m.span() for m in re.finditer(re.escape(stripped_target), self.full_text)]
-        if matches:
-            return [(s, e - s) for s, e in matches]
-
-        # 4. Fuzzy Regex Match
-        try:
-            pattern = self._make_fuzzy_regex(target_text)
-            matches = [m.span() for m in re.finditer(pattern, self.full_text)]
-            if matches:
-                return [(s, e - s) for s, e in matches]
-        except re.error:
-            pass
+        # Field-markup fallback — see find_match_index for rationale.
+        visible, index_map = self._build_field_visible_projection(self.full_text)
+        if len(visible) != len(self.full_text):
+            v_matches = self._find_all_indices_in(target_text, visible)
+            if v_matches:
+                return [self._map_visible_span_to_full(s, length, index_map) for s, length in v_matches]
 
         return []
 
