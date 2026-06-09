@@ -34,6 +34,12 @@ w16du_ns = "http://schemas.microsoft.com/office/word/2023/wordml/word16du"
 if "w16du" not in nsmap:
     nsmap["w16du"] = w16du_ns
 
+# Surgical-split thresholds: split a modification into minimal sub-edits only when a single
+# delete+reinsert would needlessly re-delete a substantial shared block (the over-anchoring /
+# delete-and-restate symptom), while leaving genuine rewrites (low overlap) as one clean replace.
+_SURGICAL_SPLIT_MIN_SHARED = 16
+_SURGICAL_SPLIT_MIN_PRESERVED_RATIO = 0.5
+
 
 class BatchValidationError(Exception):
     """Raised when text edits fail location validation."""
@@ -1355,18 +1361,23 @@ class RedlineEngine:
                 proxy_edit._active_mapper_ref = active_mapper
                 return proxy_edit
 
-            if (
-                effective_op == EditOperationType.MODIFICATION
-                and len(final_target) > 100
-                and final_new
-            ):
+            if effective_op == EditOperationType.MODIFICATION and final_new and final_target:
                 from difflib import SequenceMatcher
 
-                matcher = SequenceMatcher(None, final_target, final_new)
-                similarity = matcher.ratio()
-                if similarity > 0.7:
+                matcher = SequenceMatcher(None, final_target, final_new, autojunk=False)
+                opcodes = matcher.get_opcodes()
+                equal_runs = [i2 - i1 for tag, i1, i2, _j1, _j2 in opcodes if tag == "equal"]
+                longest_equal = max(equal_runs, default=0)
+                total_equal = sum(equal_runs)
+                non_equal = [op for op in opcodes if op[0] != "equal"]
+                preserved_ratio = total_equal / len(final_target)
+                if (
+                    longest_equal >= _SURGICAL_SPLIT_MIN_SHARED
+                    and preserved_ratio >= _SURGICAL_SPLIT_MIN_PRESERVED_RATIO
+                    and len(non_equal) >= 2
+                ):
                     sub_edits: list[ModifyText] = []
-                    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                    for tag, i1, i2, j1, j2 in opcodes:
                         if tag == "equal":
                             continue
                         sub = ModifyText(
@@ -1389,10 +1400,10 @@ class RedlineEngine:
                         for sub in sub_edits[1:]:
                             sub.comment = ""
                         logger.info(
-                            "Adeu surgical split: target_len=%d new_len=%d sim=%.2f fanout=%d sub_lens=%s",
+                            "Adeu surgical split: target_len=%d new_len=%d preserved=%.2f fanout=%d sub_lens=%s",
                             len(final_target),
                             len(final_new),
-                            similarity,
+                            preserved_ratio,
                             len(sub_edits),
                             [len(s.target_text or "") for s in sub_edits],
                         )
