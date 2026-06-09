@@ -51,3 +51,27 @@ def test_genuine_rewrite_is_not_oversplit():
     assert "solely liable" in joined, (
         f"low-overlap rewrite was over-split / preserved instead of cleanly replaced: {dels}"
     )
+
+
+def test_scattered_rewrite_does_not_fragment_into_word_soup():
+    """A reworded sentence that shares many *scattered* short runs must NOT surgical-split.
+
+    The shared words ("do not", "internally", "need", "know", "General Counsel") push
+    preserved_ratio over the gate, but no single shared block dominates — splitting on the
+    diff opcodes produced word-level soup (e.g. ``c[-omm-]u[-nicate about-]{+ss+}``). The
+    contiguity guard (dominant-block ratio + fanout cap) forces a single clean delete block.
+    """
+    target = (
+        "Do not discuss the Matter externally and do not communicate about it internally "
+        "except on a need-to-know basis and as directed by the General Counsel."
+    )
+    new = (
+        "Do not discuss the Matter outside of The Suite, and do not discuss it internally "
+        "except with people who need to know and only as directed by the General Counsel."
+    )
+    xml = _apply(target, target, new)
+    dels = re.findall(r"<w:delText[^>]*>(.*?)</w:delText>", xml)
+    assert len(dels) <= 2, f"scattered rewrite fragmented into {len(dels)} delete runs (word soup): {dels}"
+    assert any("communicate about it internally except" in d for d in dels), (
+        f"the reworded span was not deleted as one contiguous block: {dels}"
+    )

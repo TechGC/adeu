@@ -39,6 +39,11 @@ if "w16du" not in nsmap:
 # delete-and-restate symptom), while leaving genuine rewrites (low overlap) as one clean replace.
 _SURGICAL_SPLIT_MIN_SHARED = 16
 _SURGICAL_SPLIT_MIN_PRESERVED_RATIO = 0.5
+# Contiguity guards: only split when the preserved text is ONE dominant block with edits at its
+# margins (a clause restate). A reworded sentence shares many scattered short runs — splitting it
+# yields unreadable word-level soup, so fall back to a single clean delete-old + insert-new block.
+_SURGICAL_SPLIT_MIN_DOMINANCE = 0.6
+_SURGICAL_SPLIT_MAX_FANOUT = 8
 
 
 class BatchValidationError(Exception):
@@ -1371,10 +1376,13 @@ class RedlineEngine:
                 total_equal = sum(equal_runs)
                 non_equal = [op for op in opcodes if op[0] != "equal"]
                 preserved_ratio = total_equal / len(final_target)
+                dominant_ratio = longest_equal / total_equal if total_equal else 0.0
                 if (
                     longest_equal >= _SURGICAL_SPLIT_MIN_SHARED
                     and preserved_ratio >= _SURGICAL_SPLIT_MIN_PRESERVED_RATIO
                     and len(non_equal) >= 2
+                    and len(non_equal) <= _SURGICAL_SPLIT_MAX_FANOUT
+                    and dominant_ratio >= _SURGICAL_SPLIT_MIN_DOMINANCE
                 ):
                     sub_edits: list[ModifyText] = []
                     for tag, i1, i2, j1, j2 in opcodes:
