@@ -179,6 +179,57 @@ class DocumentMapper:
 
         return current
 
+    def _normalize_with_map(self, text: str) -> Tuple[str, List[int]]:
+        """Project `text` to a decoration-free string plus an index map back to `text`.
+
+        Drops inline bold/italic emphasis markers (``**``/``__``) and flattens real hyperlinks
+        ``[label](url)`` to just ``label`` — the two decorations the extractor never sees, so a
+        clean LLM anchor can match. Cross-reference / field markup ``[~…~](#…)`` is left intact so
+        the existing field-markup fallback (and LLO-910) is untouched.
+
+        Returns `(normalized, index_map)` where `index_map[i]` is the index in `text` of the i-th
+        normalized char, and `index_map[len(normalized)] == len(text)` (end sentinel). Callers map
+        a hit in the normalized string back to original (untouched-mapper) coordinates, so apply and
+        the verifier run on the real offset->run mapping.
+        """
+        out: List[str] = []
+        idx_map: List[int] = []
+        i = 0
+        n = len(text)
+        in_link = False
+        while i < n:
+            if text.startswith("**", i) or text.startswith("__", i):
+                i += 2
+                continue
+            if not in_link and text[i] == "[" and not (i + 1 < n and text[i + 1] == "~"):
+                in_link = True
+                i += 1
+                continue
+            if in_link and text.startswith("](", i):
+                end = text.find(")", i + 2)
+                i = end + 1 if end != -1 else i + 2
+                in_link = False
+                continue
+            out.append(text[i])
+            idx_map.append(i)
+            i += 1
+        idx_map.append(n)
+        return "".join(out), idx_map
+
+    def _find_normalized_index_in(self, target_text: str, haystack: str) -> Tuple[int, int]:
+        """Fallback matcher: find `target_text` in a bold/hyperlink-flattened view of `haystack`,
+        return the span in `haystack` (original) coordinates. (-1, 0) on miss."""
+        norm_hay, idx_map = self._normalize_with_map(haystack)
+        norm_target, _ = self._normalize_with_map(target_text)
+        if not norm_target:
+            return -1, 0
+        pos = norm_hay.find(norm_target)
+        if pos == -1:
+            return -1, 0
+        start = idx_map[pos]
+        end = idx_map[pos + len(norm_target)]
+        return start, end - start
+
     def _strip_markdown_formatting(self, text: str) -> str:
         """
         Strips markdown formatting markers from text for matching purposes.
@@ -573,7 +624,7 @@ class DocumentMapper:
         except re.error:
             pass
 
-        return -1, 0
+        return self._find_normalized_index_in(target_text, haystack)
 
     def _find_all_indices_in(self, target_text: str, haystack: str) -> List[Tuple[int, int]]:
         """Runs the exact → smart-quote → markdown-strip → fuzzy-regex ladder against `haystack`, all matches."""
@@ -599,6 +650,22 @@ class DocumentMapper:
                 return [(s, e - s) for s, e in matches]
         except re.error:
             pass
+
+        norm_hay, idx_map = self._normalize_with_map(haystack)
+        norm_target, _ = self._normalize_with_map(target_text)
+        if norm_target:
+            spans = []
+            search = 0
+            while True:
+                pos = norm_hay.find(norm_target, search)
+                if pos == -1:
+                    break
+                start = idx_map[pos]
+                end = idx_map[pos + len(norm_target)]
+                spans.append((start, end - start))
+                search = pos + len(norm_target)
+            if spans:
+                return spans
 
         return []
 
