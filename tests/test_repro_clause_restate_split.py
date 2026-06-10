@@ -75,3 +75,35 @@ def test_scattered_rewrite_does_not_fragment_into_word_soup():
     assert any("communicate about it internally except" in d for d in dels), (
         f"the reworded span was not deleted as one contiguous block: {dels}"
     )
+
+
+def test_multi_large_block_restate_splits_without_dominant_block():
+    """thesuite.6: a clause that preserves SEVERAL large blocks (no single dominant one) must split.
+
+    Multi-clause restate repro: two large unchanged sub-clauses bracket scattered small additions
+    ('defend,', 'liabilities,', 'or relating to'). On thesuite.5 the dominance guard (one block must
+    be >= 60% of preserved text) rejects this and wholesale-deletes the whole clause (RESTATE). The
+    multi-large-block branch must preserve the large blocks and redline only the changed regions,
+    without fragmenting into word-soup.
+    """
+    target = (
+        "The Company shall indemnify and hold harmless the Provider from any and all claims, "
+        "losses, and damages arising out of the breach of this Agreement by the Company."
+    )
+    new = (
+        "The Company shall defend, indemnify and hold harmless the Provider from any and all claims, "
+        "losses, liabilities, and damages arising out of or relating to the breach of this Agreement by the Company."
+    )
+    xml = _apply(target, target, new)
+    dels = re.findall(r"<w:delText[^>]*>(.*?)</w:delText>", xml)
+    # large preserved blocks must NOT be wholesale-deleted
+    assert not any("hold harmless the Provider from any and all claims, losses" in d for d in dels), (
+        f"large preserved block was wholesale-deleted (over-anchoring not fixed): {dels}"
+    )
+    assert not any("the breach of this Agreement by the Company" in d for d in dels), (
+        f"second large preserved block was wholesale-deleted: {dels}"
+    )
+    # genuine additions are tracked
+    assert "defend" in xml and "liabilities" in xml and "or relating to" in xml
+    # chunkiness guard: not word-soup
+    assert len(dels) <= 3, f"split fragmented into {len(dels)} delete runs (word soup): {dels}"

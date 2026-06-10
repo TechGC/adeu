@@ -44,6 +44,31 @@ _SURGICAL_SPLIT_MIN_PRESERVED_RATIO = 0.5
 # yields unreadable word-level soup, so fall back to a single clean delete-old + insert-new block.
 _SURGICAL_SPLIT_MIN_DOMINANCE = 0.6
 _SURGICAL_SPLIT_MAX_FANOUT = 8
+# thesuite.6 (multi-large-block): also split when >= 2 LARGE preserved blocks survive even without a
+# single dominant one — a clause whose unchanged sub-clauses bracket scattered small edits. Block-
+# anchored segmentation preserves those large blocks verbatim instead of restating them. The >= 40
+# floor keeps the LLO-929 word-soup guard intact (scattered rewrites share only short runs).
+_SURGICAL_SPLIT_LARGE_BLOCK_MIN = 40
+_SURGICAL_SPLIT_MIN_LARGE_BLOCKS = 2
+
+
+def _split_region_unsafe(target_frag: str, new_frag: str) -> bool:
+    """Veto a surgical sub-edit region that could corrupt structure or leak markup.
+
+    Conservative by design: any doubt returns True and the caller falls back to a single clean
+    delete+reinsert (never worse than not splitting). Guards: paragraph transplant (newline),
+    unbalanced bold/italic markers, and severed cross-reference / hyperlink tokens.
+    """
+    for frag in (target_frag, new_frag):
+        if "\n" in frag or "\r" in frag:
+            return True
+        if frag.count("**") % 2 or frag.count("__") % 2:
+            return True
+        if frag.count("[~") != frag.count("~]"):
+            return True
+        if frag.count("](") > min(frag.count("["), frag.count(")")):
+            return True
+    return False
 
 
 class BatchValidationError(Exception):
@@ -1416,6 +1441,71 @@ class RedlineEngine:
                             [len(s.target_text or "") for s in sub_edits],
                         )
                         return sub_edits
+
+                # Branch B (thesuite.6): multi-large-block restate. Split at LARGE preserved blocks
+                # even without a single dominant one; absorb small internal equal runs into the
+                # surrounding change so each emitted sub-edit is one contiguous (chunky) region.
+                big_eq = sum(1 for run in equal_runs if run >= _SURGICAL_SPLIT_LARGE_BLOCK_MIN)
+                if big_eq >= _SURGICAL_SPLIT_MIN_LARGE_BLOCKS and preserved_ratio >= _SURGICAL_SPLIT_MIN_PRESERVED_RATIO:
+                    anchor_ids = {
+                        k
+                        for k, (tag, i1, i2, _j1, _j2) in enumerate(opcodes)
+                        if tag == "equal" and (i2 - i1) >= _SURGICAL_SPLIT_LARGE_BLOCK_MIN
+                    }
+                    regions: list[list[int]] = []
+                    cur: list[int] | None = None
+                    for k, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+                        if k in anchor_ids:
+                            if cur is not None:
+                                regions.append(cur)
+                                cur = None
+                            continue
+                        if cur is None:
+                            cur = [i1, i2, j1, j2]
+                        else:
+                            cur[1], cur[3] = i2, j2
+                    if cur is not None:
+                        regions.append(cur)
+
+                    sub_edits_b: list[ModifyText] = []
+                    safe = True
+                    for i1, i2, j1, j2 in regions:
+                        region_target = final_target[i1:i2]
+                        region_new = final_new[j1:j2]
+                        if not region_target and not region_new:
+                            continue
+                        if _split_region_unsafe(region_target, region_new):
+                            safe = False
+                            break
+                        sub = ModifyText(
+                            type="modify",
+                            target_text=region_target,
+                            new_text=region_new,
+                            comment=None,
+                        )
+                        sub._match_start_index = effective_start_idx + i1
+                        sub._active_mapper_ref = active_mapper
+                        if not region_target:
+                            sub._internal_op = EditOperationType.INSERTION
+                        elif not region_new:
+                            sub._internal_op = EditOperationType.DELETION
+                        else:
+                            sub._internal_op = EditOperationType.MODIFICATION
+                        sub_edits_b.append(sub)
+
+                    if safe and 1 < len(sub_edits_b) <= _SURGICAL_SPLIT_MAX_FANOUT:
+                        for sub in sub_edits_b:
+                            sub.comment = ""
+                        min(sub_edits_b, key=lambda s: s._match_start_index or 0).comment = edit.comment
+                        logger.info(
+                            "Adeu surgical split (multi-block): target_len=%d new_len=%d preserved=%.2f big_eq=%d sub_lens=%s",
+                            len(final_target),
+                            len(final_new),
+                            preserved_ratio,
+                            big_eq,
+                            [len(s.target_text or "") for s in sub_edits_b],
+                        )
+                        return sub_edits_b
 
         proxy_edit = ModifyText(
             type="modify",
