@@ -9,6 +9,34 @@ from adeu.models import ModifyText
 logger = structlog.get_logger(__name__)
 
 
+_BOUNDARY_PUNCT = frozenset(".,;!?")
+
+
+def _is_word_char(c: str) -> bool:
+    return c.isalnum() or c == "_"
+
+
+def _splits_prefix_token(target: str, new_val: str, i: int) -> bool:
+    """Whether ending the common prefix at index ``i`` would split a token mid-word.
+
+    A cut is clean (returns ``False``) at whitespace, or where a word char meets *terminal*
+    sentence punctuation (``.,;!?``) that is not wedged between two word chars — so ``jair.`` ->
+    ``jair;`` redlines only the punctuation. Punctuation inside a token (``10,000.00``,
+    ``example.com``, ``https://x``, ``**bold**``) is not a boundary, so those stay intact.
+    ``_`` counts as a word char to keep markdown markers (``__bold__``) balanced.
+    """
+    for s in (target, new_val):
+        a, b = s[i - 1], s[i]
+        if a.isspace() or b.isspace():
+            continue
+        if _is_word_char(a) and b in _BOUNDARY_PUNCT and (i + 1 >= len(s) or not _is_word_char(s[i + 1])):
+            continue
+        if _is_word_char(b) and a in _BOUNDARY_PUNCT and (i - 2 < 0 or not _is_word_char(s[i - 2])):
+            continue
+        return True
+    return False
+
+
 def trim_common_context(target: str, new_val: str) -> tuple[int, int]:
     """
     Calculates overlapping prefix/suffix lengths between target and new_val.
@@ -25,12 +53,11 @@ def trim_common_context(target: str, new_val: str) -> tuple[int, int]:
     while prefix_len < limit and target[prefix_len] == new_val[prefix_len]:
         prefix_len += 1
 
-    # Backtrack to nearest whitespace if we split a word
+    # Backtrack to the nearest token boundary if we split a word (whitespace or a
+    # word<->punctuation transition both count as clean boundaries).
     if prefix_len < len(target) and prefix_len < len(new_val):
         while prefix_len > 0:
-            target_split = not target[prefix_len - 1].isspace() and not target[prefix_len].isspace()
-            new_split = not new_val[prefix_len - 1].isspace() and not new_val[prefix_len].isspace()
-            if target_split or new_split:
+            if _splits_prefix_token(target, new_val, prefix_len):
                 prefix_len -= 1
             else:
                 break
