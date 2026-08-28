@@ -37,6 +37,21 @@ def _splits_prefix_token(target: str, new_val: str, i: int) -> bool:
     return False
 
 
+def _standalone_underscore(text: str, from_end: bool) -> int | None:
+    """Index of the outermost lone underscore, or ``None`` when every underscore has a neighbour.
+
+    A lone underscore is a markdown italic marker; one inside a run (``_________``) is part of a
+    fill-in blank. Scans from the right when ``from_end`` is set, otherwise from the left.
+    """
+    indices = range(len(text) - 1, -1, -1) if from_end else range(len(text))
+    for idx in indices:
+        if text[idx] != "_":
+            continue
+        if (idx == 0 or text[idx - 1] != "_") and (idx == len(text) - 1 or text[idx + 1] != "_"):
+            return idx
+    return None
+
+
 def trim_common_context(target: str, new_val: str) -> tuple[int, int]:
     """
     Calculates overlapping prefix/suffix lengths between target and new_val.
@@ -83,18 +98,13 @@ def trim_common_context(target: str, new_val: str) -> tuple[int, int]:
             prefix_len = left.rfind("__")
             continue
         if u1_count % 2 != 0:
-            # Safely find the last standalone '_'
-            idx = len(left) - 1
-            while idx >= 0:
-                if (
-                    left[idx] == "_"
-                    and (idx == 0 or left[idx - 1] != "_")
-                    and (idx == len(left) - 1 or left[idx + 1] != "_")
-                ):
-                    prefix_len = idx
-                    break
-                idx -= 1
-            continue
+            standalone_idx = _standalone_underscore(left, from_end=True)
+            if standalone_idx is not None:
+                prefix_len = standalone_idx
+                continue
+            # An odd run of >=3 underscores is a fill-in blank, not an unbalanced italic marker: it
+            # collapses to one "_" with no standalone occurrence to back off to. Fall through rather
+            # than re-entering the loop with prefix_len unmoved, which never terminated.
 
         # Safety: Backtrack if we consumed a Markdown Header marker (#)
         temp_len = prefix_len
@@ -161,18 +171,11 @@ def trim_common_context(target: str, new_val: str) -> tuple[int, int]:
             suffix_len -= idx_in_right + 2
             continue
         if u1_count % 2 != 0:
-            # Safely find the first standalone '_'
-            idx_in_right = 0
-            while idx_in_right < len(right):
-                if (
-                    right[idx_in_right] == "_"
-                    and (idx_in_right == 0 or right[idx_in_right - 1] != "_")
-                    and (idx_in_right == len(right) - 1 or right[idx_in_right + 1] != "_")
-                ):
-                    suffix_len -= idx_in_right + 1
-                    break
-                idx_in_right += 1
-            continue
+            standalone_idx = _standalone_underscore(right, from_end=False)
+            if standalone_idx is not None:
+                suffix_len -= standalone_idx + 1
+                continue
+            # Same fill-in-blank case as the prefix branch: nothing to back off to, so fall through.
         break
 
     if suffix_len > 0 and target[len(target) - suffix_len :].isspace():
