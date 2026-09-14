@@ -121,6 +121,7 @@ class RedlineEngine:
         self.comments_manager = CommentsManager(self.doc)
         self.clean_mapper: Optional[DocumentMapper] = None
         self.skipped_details: List[str] = []
+        self.edit_results: List[dict] = []
 
     def _get_paired_nodes(self, node):
         """
@@ -960,6 +961,7 @@ class RedlineEngine:
         Actions are applied first, the Virtual DOM map is rebuilt, and then text edits are validated and applied.
         """
         self.skipped_details = []
+        self.edit_results = []
         actions = [c for c in changes if isinstance(c, (AcceptChange, RejectChange, ReplyComment))]
         edits = [c for c in changes if isinstance(c, (ModifyText, InsertTableRow, DeleteTableRow))]
 
@@ -986,6 +988,7 @@ class RedlineEngine:
             "edits_applied": applied_edits,
             "edits_skipped": skipped_edits,
             "skipped_details": self.skipped_details,
+            "edit_results": self.edit_results,
         }
 
     def apply_edits(self, edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow]]) -> tuple[int, int]:
@@ -993,11 +996,16 @@ class RedlineEngine:
         skipped = 0
 
         resolved_edits = []
+        # Input order is the only stable identity an edit has. One caller edit keeps one entry in
+        # the results however many tracked changes the surgical split fans it into, so the caller
+        # can map an outcome back to the edit it submitted rather than inferring it from counts.
+        pre_resolve_failures: Dict[int, str] = {}
+        sub_outcomes: Dict[int, List[Tuple[bool, Optional[str], Optional[int]]]] = {}
 
         # Pre-resolve phase: locate all edits against initial clean state
-        for edit in edits:
+        for source_index, edit in enumerate(edits):
             if edit._match_start_index is not None:
-                resolved_edits.append((edit, getattr(edit, "new_text", None)))
+                resolved_edits.append((edit, getattr(edit, "new_text", None), source_index))
             elif isinstance(edit, (InsertTableRow, DeleteTableRow)):
                 # Simplified resolution for structural edits. Match clean-view-first
                 # for the same reason as validate_edits / _pre_resolve_heuristic_edit:
@@ -1011,9 +1019,10 @@ class RedlineEngine:
                 if matches:
                     # validate_edits already ensured uniqueness
                     edit._match_start_index = matches[0][0]
-                    resolved_edits.append((edit, None))
+                    resolved_edits.append((edit, None, source_index))
                 else:
                     skipped += 1
+                    pre_resolve_failures[source_index] = "structural_anchor_not_found"
                     target_snippet = edit.target_text.strip()[:40]
                     self.skipped_details.append(f"- Failed to apply structural edit targeting: '{target_snippet}...'")
             else:
@@ -1021,11 +1030,12 @@ class RedlineEngine:
                 if resolved:
                     if isinstance(resolved, list):
                         for r in resolved:
-                            resolved_edits.append((r, r.new_text))
+                            resolved_edits.append((r, r.new_text, source_index))
                     else:
-                        resolved_edits.append((resolved, edit.new_text))
+                        resolved_edits.append((resolved, edit.new_text, source_index))
                 else:
                     skipped += 1
+                    pre_resolve_failures[source_index] = "anchor_not_found"
 
                     # N2 Fix: Safe display text fallback for heuristic failures
                     display_text = edit.target_text or "insertion"
@@ -1048,13 +1058,14 @@ class RedlineEngine:
         resolved_edits.sort(key=lambda x: x[0]._match_start_index or 0, reverse=True)
         occupied_ranges: List[Tuple[int, int]] = []
 
-        for edit, orig_new in resolved_edits:
+        for edit, orig_new, source_index in resolved_edits:
             start = edit._match_start_index or 0
             end = start + (len(edit.target_text) if edit.target_text else 0)
 
             if any(start < occ_end and end > occ_start for occ_start, occ_end in occupied_ranges):
                 logger.warning(f"Skipping overlapping edit at index {start}")
                 skipped += 1
+                sub_outcomes.setdefault(source_index, []).append((False, "overlap", start))
 
                 display_text = edit.target_text or "insertion"
                 if not display_text.strip() and hasattr(edit, "_original_target_text"):
@@ -1077,9 +1088,11 @@ class RedlineEngine:
 
             if success:
                 applied += 1
+                sub_outcomes.setdefault(source_index, []).append((True, None, start))
                 occupied_ranges.append((start, end))
             else:
                 skipped += 1
+                sub_outcomes.setdefault(source_index, []).append((False, "apply_failed", start))
 
                 display_text = edit.target_text or "insertion"
                 if not display_text.strip() and hasattr(edit, "_original_target_text"):
@@ -1096,7 +1109,55 @@ class RedlineEngine:
                     )
                 self.skipped_details.append(msg)
 
+        self.edit_results = self._build_edit_results(edits, pre_resolve_failures, sub_outcomes)
+
         return applied, skipped
+
+    def _build_edit_results(
+        self,
+        edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow]],
+        pre_resolve_failures: Dict[int, str],
+        sub_outcomes: Dict[int, List[Tuple[bool, Optional[str], Optional[int]]]],
+    ) -> List[dict]:
+        """
+        Collapses each caller edit's resolved spans into one outcome, keyed by its input index.
+
+        The surgical split fans a single caller edit into several tracked changes, so an edit can
+        land partly. `parts_applied` / `parts_total` keep that visible rather than forcing it into
+        a boolean, and `match_start_index` is the leftmost span the edit resolved to.
+        """
+        results: List[dict] = []
+        for source_index in range(len(edits)):
+            parts = sub_outcomes.get(source_index, [])
+            parts_total = len(parts)
+            parts_applied = sum(1 for landed, _reason, _start in parts if landed)
+            starts = [start for _landed, _reason, start in parts if start is not None]
+            first_failure = next((reason for landed, reason, _start in parts if not landed and reason), None)
+
+            if parts_total == 0:
+                status = "skipped"
+                reason = pre_resolve_failures.get(source_index, "anchor_not_found")
+            elif parts_applied == parts_total:
+                status = "applied"
+                reason = None
+            elif parts_applied == 0:
+                status = "skipped"
+                reason = first_failure or "apply_failed"
+            else:
+                status = "partial"
+                reason = first_failure or "apply_failed"
+
+            results.append(
+                {
+                    "index": source_index,
+                    "status": status,
+                    "reason": reason,
+                    "parts_applied": parts_applied,
+                    "parts_total": parts_total,
+                    "match_start_index": min(starts) if starts else None,
+                }
+            )
+        return results
 
     def _apply_insert_row(self, edit: InsertTableRow) -> bool:
         start_idx = edit._match_start_index
@@ -1446,7 +1507,10 @@ class RedlineEngine:
                 # even without a single dominant one; absorb small internal equal runs into the
                 # surrounding change so each emitted sub-edit is one contiguous (chunky) region.
                 big_eq = sum(1 for run in equal_runs if run >= _SURGICAL_SPLIT_LARGE_BLOCK_MIN)
-                if big_eq >= _SURGICAL_SPLIT_MIN_LARGE_BLOCKS and preserved_ratio >= _SURGICAL_SPLIT_MIN_PRESERVED_RATIO:
+                if (
+                    big_eq >= _SURGICAL_SPLIT_MIN_LARGE_BLOCKS
+                    and preserved_ratio >= _SURGICAL_SPLIT_MIN_PRESERVED_RATIO
+                ):
                     anchor_ids = {
                         k
                         for k, (tag, i1, i2, _j1, _j2) in enumerate(opcodes)
