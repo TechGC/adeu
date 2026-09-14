@@ -3,7 +3,7 @@ from io import BytesIO
 
 from docx import Document
 
-from adeu.models import ModifyText
+from adeu.models import AcceptChange, ModifyText
 from adeu.redline.engine import RedlineEngine
 
 
@@ -134,6 +134,33 @@ def test_edit_results_reports_the_resolved_offset():
     assert result["status"] == "applied"
     assert isinstance(result["match_start_index"], int)
     assert result["match_start_index"] >= 0
+
+
+def test_edit_results_indexes_the_callers_change_list_not_the_filtered_edits():
+    """
+    `process_batch` filters actions out before applying edits, so the apply phase numbers edits
+    against its own sublist. The caller only ever sees the `changes` list it passed, so the
+    indices are renumbered against that -- otherwise a batch mixing actions and edits silently
+    reports an edit under the position of a different change.
+    """
+    first = _engine_from_paragraphs(
+        "The Company shall pay the annual bonus in March.",
+        "Governing law is the State of Delaware.",
+    )
+    first.apply_edits([ModifyText(target_text="in March", new_text="in January")])
+    redlined = first.save_to_stream()
+
+    engine = RedlineEngine(redlined, author="Test AI")
+    changes = [
+        AcceptChange(target_id="Chg:1"),
+        ModifyText(target_text="State of Delaware", new_text="State of New York"),
+    ]
+    stats = engine.process_batch(changes)
+
+    # The edit sits at position 1 of `changes` but at position 0 of the filtered edit sublist.
+    assert stats["actions_applied"] == 1, "the action must land, or the filtering this guards never happens"
+    assert [r["index"] for r in stats["edit_results"]] == [1]
+    assert changes[stats["edit_results"][0]["index"]] is changes[1]
 
 
 def test_edit_results_is_reset_between_batches():

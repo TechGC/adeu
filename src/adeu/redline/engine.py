@@ -964,6 +964,11 @@ class RedlineEngine:
         self.edit_results = []
         actions = [c for c in changes if isinstance(c, (AcceptChange, RejectChange, ReplyComment))]
         edits = [c for c in changes if isinstance(c, (ModifyText, InsertTableRow, DeleteTableRow))]
+        # Edits are a filtered subset of `changes`, so apply_edits numbers them against its own
+        # list. Callers only ever see `changes`, so the results are renumbered against that below.
+        edit_positions = [
+            i for i, c in enumerate(changes) if isinstance(c, (ModifyText, InsertTableRow, DeleteTableRow))
+        ]
 
         applied_actions, skipped_actions = 0, 0
         if actions:
@@ -981,6 +986,8 @@ class RedlineEngine:
         applied_edits, skipped_edits = 0, 0
         if edits:
             applied_edits, skipped_edits = self.apply_edits(edits)
+            for result in self.edit_results:
+                result["index"] = edit_positions[result["index"]]
 
         return {
             "actions_applied": applied_actions,
@@ -1125,6 +1132,10 @@ class RedlineEngine:
         The surgical split fans a single caller edit into several tracked changes, so an edit can
         land partly. `parts_applied` / `parts_total` keep that visible rather than forcing it into
         a boolean, and `match_start_index` is the leftmost span the edit resolved to.
+
+        `index` addresses the `edits` list passed to `apply_edits`. Since `process_batch` filters
+        actions out of `changes` before calling it, `process_batch` renumbers these against the
+        `changes` list the caller actually passed, so a caller never sees an internal position.
         """
         results: List[dict] = []
         for source_index in range(len(edits)):
