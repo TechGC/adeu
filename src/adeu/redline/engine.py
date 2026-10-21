@@ -17,6 +17,7 @@ from adeu.models import (
     AcceptChange,
     DeleteTableRow,
     DocumentChange,
+    EditComment,
     EditOperationType,
     InsertTableRow,
     ModifyText,
@@ -287,7 +288,7 @@ class RedlineEngine:
         text: str,
         anchor_run: Optional[Run] = None,
         anchor_paragraph: Optional[Paragraph] = None,
-        comment: Optional[str] = None,
+        comment: Union[str, List[EditComment], None] = None,
         suppress_inherited: bool = False,
     ) -> Tuple[Optional[Any], Optional[Any]]:
         """
@@ -678,10 +679,14 @@ class RedlineEngine:
         parent.replace(run._r, del_tag)
         return del_tag
 
-    def _attach_comment(self, parent_element, start_element, end_element, text: str):
-        if not text:
-            return
-        comment_id = self.comments_manager.add_comment(self.author, text)
+    def _attach_comment(self, parent_element, start_element, end_element, comment: Union[str, List[EditComment], None]):
+        entries = [EditComment(text=comment)] if isinstance(comment, str) else (comment or [])
+        for entry in entries:
+            if entry.text:
+                self._attach_one_comment(parent_element, start_element, end_element, entry)
+
+    def _attach_one_comment(self, parent_element, start_element, end_element, entry: EditComment):
+        comment_id = self.comments_manager.add_comment(entry.author or self.author, entry.text)
         range_start = create_element("w:commentRangeStart")
         create_attribute(range_start, "w:id", comment_id)
         range_end = create_element("w:commentRangeEnd")
@@ -704,10 +709,14 @@ class RedlineEngine:
         parent_element.insert(end_index + 1, range_end)
         parent_element.insert(end_index + 2, ref_run)
 
-    def _attach_comment_spanning(self, start_p, start_el, end_p, end_el, text: str):
-        if not text:
-            return
-        comment_id = self.comments_manager.add_comment(self.author, text)
+    def _attach_comment_spanning(self, start_p, start_el, end_p, end_el, comment: Union[str, List[EditComment], None]):
+        entries = [EditComment(text=comment)] if isinstance(comment, str) else (comment or [])
+        for entry in entries:
+            if entry.text:
+                self._attach_one_comment_spanning(start_p, start_el, end_p, end_el, entry)
+
+    def _attach_one_comment_spanning(self, start_p, start_el, end_p, end_el, entry: EditComment):
+        comment_id = self.comments_manager.add_comment(entry.author or self.author, entry.text)
 
         range_start = create_element("w:commentRangeStart")
         create_attribute(range_start, "w:id", comment_id)

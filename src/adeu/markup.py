@@ -441,7 +441,7 @@ def apply_edits_to_markdown(
         markup = _build_critic_markup(
             target_text=isolated_target,
             new_text=isolated_new,
-            comment=edit.comment,
+            comment=edit.comment_text,
             edit_index=orig_idx,
             include_index=include_index,
             highlight_only=highlight_only,

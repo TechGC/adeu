@@ -1,4 +1,4 @@
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -11,6 +11,13 @@ class EditOperationType:
     INSERTION = "INSERTION"
     DELETION = "DELETION"
     MODIFICATION = "MODIFICATION"
+
+
+class EditComment(BaseModel):
+    """One comment bubble on an edit, optionally under its own author."""
+
+    text: str = Field(..., description="Comment text.")
+    author: Optional[str] = Field(default=None, description="Comment author; defaults to the engine author.")
 
 
 class ModifyText(BaseModel):
@@ -39,10 +46,20 @@ class ModifyText(BaseModel):
         ),
     )
 
-    comment: Optional[str] = Field(
+    comment: Optional[Union[str, List[EditComment]]] = Field(
         None,
-        description="Text to appear in a comment bubble (Review Pane) linked to this edit.",
+        description=(
+            "Text to appear in a comment bubble (Review Pane) linked to this edit, "
+            "or a list of comments (each with an optional author) to attach to the same change."
+        ),
     )
+
+    @property
+    def comment_text(self) -> Optional[str]:
+        """The comment as plain text, joining a list of comments with blank lines."""
+        if isinstance(self.comment, list):
+            return "\n\n".join(entry.text for entry in self.comment if entry.text) or None
+        return self.comment
 
     # Internal use only. PrivateAttr is invisible to the MCP API schema.
     _match_start_index: Optional[int] = PrivateAttr(default=None)

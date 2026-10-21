@@ -14,7 +14,7 @@ from adeu.mcp_components._response_builders import (
     build_outline_response,
     build_paginated_response,
 )
-from adeu.models import DeleteTableRow, InsertTableRow
+from adeu.models import DeleteTableRow, InsertTableRow, ModifyText
 
 logger = structlog.get_logger(__name__)
 
@@ -362,6 +362,9 @@ if sys.platform == "win32":
         try:
             for change in changes:
                 try:
+                    # Word COM takes one comment string per range, so a comment list is joined.
+                    if isinstance(change, ModifyText) and isinstance(change.comment, list):
+                        change = change.model_copy(update={"comment": change.comment_text})
                     if isinstance(change, (InsertTableRow, DeleteTableRow)):
                         stats["failed"] += 1
                         stats["skipped_details"].append(
