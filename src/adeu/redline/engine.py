@@ -709,6 +709,23 @@ class RedlineEngine:
         parent_element.insert(end_index + 1, range_end)
         parent_element.insert(end_index + 2, ref_run)
 
+    def _attach_comment_to_added_paragraphs(self, anchor_element, last_p, comment: Union[str, List[EditComment], None]):
+        """
+        Anchors a comment from the first paragraph track_insert added after the anchor's paragraph to last_p.
+        """
+        anchor_p = anchor_element
+        while anchor_p is not None and anchor_p.tag != qn("w:p"):
+            anchor_p = anchor_p.getparent()
+        first_p = anchor_p.getnext() if anchor_p is not None else None
+        if first_p is None:
+            return
+        first_ins = first_p.findall(qn("w:ins"))[0]
+        last_ins = last_p.findall(qn("w:ins"))[-1]
+        if first_p is last_p:
+            self._attach_comment(first_p, first_ins, last_ins, comment)
+        else:
+            self._attach_comment_spanning(first_p, first_ins, last_p, last_ins, comment)
+
     def _attach_comment_spanning(self, start_p, start_el, end_p, end_el, comment: Union[str, List[EditComment], None]):
         entries = [EditComment(text=comment)] if isinstance(comment, str) else (comment or [])
         for entry in entries:
@@ -1698,6 +1715,9 @@ class RedlineEngine:
                             self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
                         else:
                             self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+                elif edit.comment and last_p is not None:
+                    # new_text began with a newline: no inline part, only the paragraphs added after it.
+                    self._attach_comment_to_added_paragraphs(parent, last_p, edit.comment)
             else:
                 if anchor_run:
                     next_run = self._get_next_run(anchor_run)
@@ -1726,6 +1746,9 @@ class RedlineEngine:
                             self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
                         else:
                             self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+                elif edit.comment and last_p is not None:
+                    # new_text began with a newline: no inline part, only the paragraphs added after it.
+                    self._attach_comment_to_added_paragraphs(parent, last_p, edit.comment)
             return True
 
         target_runs = active_mapper.find_target_runs_by_index(start_idx, length, rebuild_map=rebuild_map)

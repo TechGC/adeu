@@ -172,3 +172,23 @@ def test_comment_text_joins_a_comment_list():
     edit = ModifyText(target_text="a", new_text="b", comment=[EditComment(text="One"), EditComment(text="Two")])
 
     assert edit.comment_text == "One\n\nTwo"
+
+
+def test_paragraphs_added_after_the_target_keep_their_comment():
+    sentence = "This Agreement is governed by the laws of New York."
+    edit = ModifyText(
+        target_text=sentence,
+        new_text=(
+            f"{sentence}\nConfidentiality: Firm keeps Client information confidential."
+            "\nNon-Solicitation: Firm will not recruit Client employees."
+        ),
+        comment="Adds the missing protections.",
+    )
+
+    doc_xml, comments_xml = _apply_and_read(sentence, edit)
+
+    assert _authors_by_text(comments_xml) == {"Adds the missing protections.": "Jane Doe"}
+    start_id = re.search(r'<w:commentRangeStart[^>]*w:id="(\d+)"', doc_xml).group(1)
+    anchored = doc_xml.split("<w:commentRangeStart")[1].split(f'<w:commentRangeEnd w:id="{start_id}"')[0]
+    assert "Confidentiality:" in anchored
+    assert "Non-Solicitation:" in anchored
