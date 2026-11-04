@@ -1,10 +1,12 @@
 import io
 import re
+import zipfile
 
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 
 from adeu.models import EditComment, ModifyText
+from adeu.redline.comments import CommentsManager, w14_ns, w15_ns
 from adeu.redline.engine import RedlineEngine
 
 
@@ -192,3 +194,94 @@ def test_paragraphs_added_after_the_target_keep_their_comment():
     anchored = doc_xml.split("<w:commentRangeStart")[1].split(f'<w:commentRangeEnd w:id="{start_id}"')[0]
     assert "Confidentiality:" in anchored
     assert "Non-Solicitation:" in anchored
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_W16SE_NS = "http://schemas.microsoft.com/office/word/2015/wordml/symex"
+
+
+def _docx_with_existing_comments(paragraph: str, comments_root_attrs: str, comment_body: str) -> io.BytesIO:
+    doc = Document()
+    doc.add_paragraph(paragraph)
+    source = io.BytesIO()
+    doc.save(source)
+
+    comments_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:comments {comments_root_attrs}><w:comment w:id="0" w:author="Counterparty">{comment_body}</w:comment>'
+        "</w:comments>"
+    )
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source.getvalue())) as src, zipfile.ZipFile(result, "w") as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"</Types>",
+                    b'<Override PartName="/word/comments.xml" ContentType="application/'
+                    b'vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/></Types>',
+                )
+            if item.filename == "word/_rels/document.xml.rels":
+                data = data.replace(
+                    b"</Relationships>",
+                    f'<Relationship Id="rIdComments" Type="{RT.COMMENTS}" Target="comments.xml"/>'
+                    f'<Relationship Id="rIdLink" Type="{RT.HYPERLINK}" Target="https://example.com" '
+                    'TargetMode="External"/></Relationships>'.encode(),
+                )
+            out.writestr(item, data)
+        out.writestr("word/comments.xml", comments_xml)
+    result.seek(0)
+    return result
+
+
+def _apply_to_existing_comments(comments_root_attrs: str, comment_body: str) -> str:
+    sentence = "The quick brown fox."
+    engine = RedlineEngine(_docx_with_existing_comments(sentence, comments_root_attrs, comment_body), author="Jane Doe")
+    engine.apply_edits([ModifyText(target_text="quick", new_text="slow", comment="Foxes are not always quick.")])
+    result = Document(engine.save_to_stream())
+    return next(rel.target_part for rel in result.part.rels.values() if rel.reltype == RT.COMMENTS).blob.decode()
+
+
+def test_comment_added_beside_an_existing_hyperlinked_comment_keeps_its_namespace():
+    hyperlinked_comment = '<w:p><w:hyperlink r:id="rIdLink"><w:r><w:t>see policy</w:t></w:r></w:hyperlink></w:p>'
+
+    comments_xml = _apply_to_existing_comments(f'xmlns:w="{_W_NS}" xmlns:r="{_R_NS}"', hyperlinked_comment)
+
+    assert f'xmlns:r="{_R_NS}"' in comments_xml
+    assert 'r:id="rIdLink"' in comments_xml
+    assert _authors_by_text(comments_xml) == {"see policy": "Counterparty", "Foxes are not always quick.": "Jane Doe"}
+    assert "w14:paraId" in comments_xml
+    assert "ns0:" not in comments_xml
+
+
+def test_existing_ignorable_prefixes_survive_alongside_the_added_ones():
+    root_attrs = f'xmlns:w="{_W_NS}" xmlns:mc="{_MC_NS}" xmlns:w16se="{_W16SE_NS}" mc:Ignorable="w16se"'
+
+    comments_xml = _apply_to_existing_comments(root_attrs, "<w:p><w:r><w:t>Earlier note</w:t></w:r></w:p>")
+
+    ignorable = re.search(r'mc:Ignorable="([^"]*)"', comments_xml).group(1).split()
+    assert ignorable == ["w16se", "w14", "w15", "w16cid", "w16cex"]
+    assert f'xmlns:w16se="{_W16SE_NS}"' in comments_xml
+
+
+def test_w14_bound_to_another_uri_is_rebound_so_new_comments_keep_the_w14_prefix():
+    comments_xml = _apply_to_existing_comments(
+        f'xmlns:w="{_W_NS}" xmlns:w14="urn:other"', "<w:p><w:r><w:t>Earlier note</w:t></w:r></w:p>"
+    )
+
+    assert f'xmlns:w14="{w14_ns}"' in comments_xml
+    assert "w14:paraId" in comments_xml
+    assert "ns0:paraId" not in comments_xml
+
+
+def test_a_root_already_declaring_w14_and_w15_as_ignorable_is_left_untouched():
+    root_attrs = (
+        f'xmlns:w="{_W_NS}" xmlns:w14="{w14_ns}" xmlns:w15="{w15_ns}" xmlns:mc="{_MC_NS}" mc:Ignorable="w14 w15"'
+    )
+    doc = Document(_docx_with_existing_comments("Text.", root_attrs, "<w:p><w:r><w:t>Earlier</w:t></w:r></w:p>"))
+    manager = CommentsManager(doc)
+    original_root = manager._get_or_create_comments_part().element
+
+    assert manager.comments_part.element is original_root

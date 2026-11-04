@@ -1,6 +1,6 @@
+import copy
 import datetime
 import random
-import re
 from typing import Dict, Optional
 
 import structlog
@@ -9,7 +9,7 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.opc.part import Part, XmlPart
 from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import nsdecls, nsmap, qn
-from docx.oxml.xmlchemy import serialize_for_reading
+from lxml import etree
 
 logger = structlog.get_logger(__name__)
 
@@ -32,6 +32,11 @@ if "w16cid" not in nsmap:
 w16cex_ns = "http://schemas.microsoft.com/office/word/2018/wordml/cex"
 if "w16cex" not in nsmap:
     nsmap["w16cex"] = w16cex_ns
+
+mc_ns = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+# Extended namespaces the comments root declares and flags Ignorable, or Word drops the attributes
+EXTENDED_NAMESPACES = {"w14": w14_ns, "w15": w15_ns, "w16cid": w16cid_ns, "w16cex": w16cex_ns}
 
 # Register w16se namespace (often used in ignorable)
 if "w16se" not in nsmap:
@@ -260,48 +265,26 @@ class CommentsManager:
             return
 
         element = self._comments_part.element
-        has_w14 = "w14" in element.nsmap and element.nsmap["w14"] == w14_ns
-        has_w15 = "w15" in element.nsmap and element.nsmap["w15"] == w15_ns
-
-        # Check for mc:Ignorable
-        # This is harder to check via nsmap, checking string serialization is robust
-        xml_str = serialize_for_reading(element)
-        has_ignorable = "mc:Ignorable" in xml_str and "w14" in xml_str and "w15" in xml_str
-
-        if has_w14 and has_w15 and has_ignorable:
+        ignorable_attr = f"{{{mc_ns}}}Ignorable"
+        ignorable = (element.get(ignorable_attr) or "").split()
+        is_root_ready = all(
+            element.nsmap.get(prefix) == EXTENDED_NAMESPACES[prefix] and prefix in ignorable
+            for prefix in ("w14", "w15")
+        )
+        if is_root_ready:
             return
 
-        # Brute force update of the root tag
-
-        # Check if the existing root tag is self-closing (e.g. <w:comments ... />)
-        # This happens if the comments part is empty.
-        match = re.search(r"<w:comments[^>]*>", xml_str)
-        if not match:
-            return
-
-        original_tag = match.group(0)
-        is_self_closing = original_tag.strip().endswith("/>")
-
-        # We reconstruct the opening tag with all needed namespaces and Ignorable
-        replacement = (
-            f'<w:comments xmlns:w="{nsmap["w"]}" xmlns:w14="{w14_ns}" xmlns:w15="{w15_ns}" '
-            f'xmlns:w16cid="{w16cid_ns}" xmlns:w16cex="{w16cex_ns}" '
-            f'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-            f'mc:Ignorable="w14 w15 w16cid w16cex">'
-        )
-
-        if is_self_closing:
-            replacement += "</w:comments>"
-
-        logger.debug(
-            "Patching root element namespaces",
-            original=xml_str[:100],
-            is_self_closing=is_self_closing,
-        )
-
-        # Replace the matched tag with our new tag(s)
-        new_xml = xml_str.replace(original_tag, replacement, 1)
-        self._comments_part._element = parse_xml(new_xml)
+        # lxml cannot add declarations to an existing element, so rebuild the root around copies of
+        # its children. Keep every declaration it had: existing comments may use any of them (r:id
+        # on a hyperlink), and Ignorable may name any of them.
+        wanted = {**EXTENDED_NAMESPACES, "mc": mc_ns}
+        rebound = {prefix: uri for prefix, uri in wanted.items() if element.nsmap.get(prefix) != uri}
+        merged_ignorable = " ".join(dict.fromkeys([*ignorable, *EXTENDED_NAMESPACES]))
+        logger.debug("Patching root element namespaces", rebound=sorted(rebound), ignorable=merged_ignorable)
+        root = etree.Element(element.tag, attrib=dict(element.attrib), nsmap={**element.nsmap, **rebound})
+        root.extend(copy.deepcopy(child) for child in element)
+        root.set(ignorable_attr, merged_ignorable)
+        self._comments_part._element = parse_xml(etree.tostring(root))
 
     def _get_next_comment_id(self) -> int:
         ids = [0]
